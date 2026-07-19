@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import torch, gymnasium, numpy; print\\('torch', torch.__version__\\); print\\('gym', gymnasium.__version__\\); print\\('cuda', torch.cuda.is_available\\(\\)\\); print\\('cpus', __import__\\('os'\\).cpu_count\\(\\)\\)\")",
+      "Bash(python -c \"import torch,os; print\\('torch', torch.__version__\\); print\\('cuda', torch.cuda.is_available\\(\\)\\); print\\('cpus', os.cpu_count\\(\\)\\)\")",
+      "Bash(where python *)",
+      "Bash(py -0p)",
+      "Read(//c/Users/micha/Documents/CS_Projects/SummerResearch/**)",
+      "Bash(python -m pip list)",
+      "Bash(python -c \"import keyboard; print\\('keyboard ok'\\)\")",
+      "Bash(timeout 300 python entropy_sign_test.py --iters 3 --n_steps 500 --n_envs 4 --seeds 1 --out smoke.json)",
+      "Bash(timeout 600 python entropy_sign_test.py --iters 4 --n_steps 500 --n_envs 4 --seeds 1 --out smoke.json)",
+      "Bash(python entropy_gradient_check.py)",
+      "Bash(timeout 600 python refactor_check.py)",
+      "Bash(timeout 600 python diagnose.py)",
+      "Bash([ -s \"$out\" ])",
+      "Bash(grep -q unique= C:/Users/micha/AppData/Local/Temp/claude/C--Users-micha-Documents-CS-Projects-SummerResearch-Comparisons/3719c250-5449-40e7-a7fa-d00c5a99364c/tasks/bdj9jx4d3.output)",
+      "Bash(sleep 3)",
+      "Bash(echo READY)",
+      "Bash(python -u diagnose.py)",
+      "Bash(python -u final_verify.py)",
+      "Bash(grep -v \"^$\")",
+      "Bash(python -u grad_balance.py)"
+    ]
+  }
+}
