@@ -9,8 +9,18 @@ Started 2026-07-19. Base: the PPO implementation in `RL/`.
 
 ## Status
 
-**Step 1 (encoder refactor + seeding + logging + entropy fix): DONE, verified.**
-Next: Step 2 (`SSLReplayBuffer` + `AuxTask` interface).
+**Steps 1–4: DONE, verified.** Step 1 (encoder refactor + seeding + logging + entropy
+fix); Step 2 (`SSLReplayBuffer` + `AuxTask`/`SparsityMethod` interfaces); Step 3 (vertical
+slice: L1, magnitude pruning, autoencoder, contrastive); Step 4 (metrics module).
+
+45 unit tests + 30 integration tests pass. The baseline path is proven **bit-identical**
+to pre-refactor `PPO.py` under cudnn-deterministic (see "Reproducibility" below).
+
+**Step 5 IN PROGRESS:** ALE/Breakout sweep, 17 conditions × 5 seeds = 85 runs @ 4M frames,
+~59h. Resumable — any cell with a `summary.json` is skipped.
+
+**The sharing-penalty question is settled on pixels. See below — the CartPole result did
+NOT transfer, and the baseline decision needs restating because of it.**
 
 ---
 
@@ -41,6 +51,45 @@ penalty." Every condition and its control must share encoder topology.
 Caveat: CartPole is the worst case for sharing (dense state, nothing to represent). **Re-measure
 the sharing penalty on pixels before generalizing** — likely first task of step 2.
 
+### RESOLVED: the sharing penalty on pixels (FlappyBirdImg, 3 seeds, 1.44M frames)
+
+Measured 2026-07-19. Arms are `shared_encoder=False` (verified param-identical to the
+legacy two-network pair), `shared_encoder=True`, and `+detach_actor_encoder`.
+
+| arm | final10 | AUC | params | wall |
+|---|---|---|---|---|
+| unshared (legacy) | 10.77 ± 1.02 | **8.18 ± 0.43** | 681,539 | 20.9 min |
+| shared | **11.28 ± 1.07** | 5.70 ± 0.53 | 341,155 | 16.3 min |
+| detach (no SSL) | 1.71 ± 0.36 | 0.51 ± 0.43 | 341,155 | 16.4 min |
+
+**The CartPole finding does not transfer.** On CartPole sharing cost final performance
+outright (−56%). On pixels there is **no final-performance penalty at all** — shared is
+nominally +4.7% ahead, ranks swap across seeds, ranges overlap almost completely — on
+**half the parameters and 21% less wall-clock**. What remains is a *sample-efficiency*
+penalty: −30.3% AUC, with `shared` [5.11, 6.39] and `unshared` [7.58, 8.54] fully
+non-overlapping across 3/3 seeds.
+
+The learning curves show why the two metrics disagree. `unshared` takes off ~10 iterations
+earlier and peaks higher (12.73 at iter 45) **then degrades 19% to 10.37 by iter 60**;
+`shared` takes off later, plateaus ~11.1–11.8, and holds — overtaking `unshared` at the
+end. So this is not "same destination, different speed"; it is an early-but-unstable curve
+against a late-but-stable one. Figure: `fig1_sharing_penalty.png`.
+
+**Consequence for the study design.** `shared_encoder=True` remains the right control, and
+the conflation risk at the top of this section still stands — but what SSL could be
+credited with recovering on pixels is *learning speed*, not *final return*. An SSL arm that
+matches baseline final score has recovered nothing; the claim has to be made on AUC or
+steps-to-threshold.
+
+Statistics: complete separation at 3v3 is Mann-Whitney p≈0.05 one-tailed / 0.10 two-tailed
+— suggestive, not conclusive. The +43% effect size is what makes it credible. The doc's
+own 5-seed minimum would settle it (~50 min).
+
+`detach` with **no SSL attached** is a starved configuration, not a candidate control: the
+encoder is shaped by the value loss alone. Both the −84% result and the "applies to SSL
+arms only" scoping decision above are consistent — do not read 1.71 as evidence about
+stop-gradient, only as the floor when nothing supplies a representation signal.
+
 ---
 
 ## Step 1: what was changed
@@ -52,6 +101,12 @@ flags `shared_encoder`, `detach_actor_encoder`, `feature_dim`.
 
 Split is exact vs `common_networks.py`: unshared `ActorCritic` param counts match the
 original two networks (MLP 9,220; CNN 678,471).
+
+**Those numbers are config-specific — they are not universal constants.** CNN 678,471 is
+`obs=(3,64,64), act=(3,3)`. For FlappyBirdImg `(4,64,64), act=(2,)` the correct figure is
+**681,539** (shared: 341,155). Parity was re-verified empirically at both shapes. Anyone
+re-running parity on a different env will see a "mismatch" and think the refactor broke;
+it did not.
 
 Known deviation: with a shared trunk the encoder gets orthogonal (policy-style) init; in the
 unshared original the value net used PyTorch defaults. Documented in the file.
@@ -81,7 +136,26 @@ processes and do not inherit parent RNG state — without this nothing is reprod
 
 ### Verified
 Param parity; `detach_actor_encoder` zeroes trunk policy grad (0.0 vs 1.81e-01); all three
-configs train; same seed → bit-identical, different seed → diverges; CSV written.
+configs train; CSV written.
+
+### Reproducibility — the "same seed → bit-identical" claim was WRONG
+
+Measured directly:
+
+| config | result |
+|---|---|
+| cuda, `deterministic_torch=False` (**the default**) | **DIVERGES**, max delta 1.4e-02 over 3 iters |
+| cuda, `deterministic_torch=True` | bit-identical |
+| cpu | bit-identical |
+
+So runs are **not** reproducible on the default GPU path. By iteration 3 the same-seed
+entropy envelope is ~0.02–0.03 — large enough that an earlier "regression" against a
+stored reference looked like a real behavioral change and was not. Anything comparing two
+runs for equality must either set `deterministic_torch=True` or use a tolerance above
+this floor.
+
+This is acceptable for the study (conclusions rest on seed-averaged behavior), but it
+means a *specific* run cannot be reproduced exactly unless determinism is switched on.
 
 Note: iteration-1 scores are identical across seeds because `policy_head.weight.div_(100)`
 makes the initial policy uniform to within 0.004 (H = ln 3 exactly). Not a seeding bug.
@@ -97,10 +171,74 @@ Loose end: even fixed, `ent_coef` 0.0 vs 0.05 barely differs on CartPole (H 1.04
 
 ## Remaining build order
 
-2. `SSLReplayBuffer` + `AuxTask` interface + wire `detach_actor_encoder` through SSL.
-3. Vertical slice: L1, magnitude pruning, autoencoder, contrastive (one per family).
-4. Metrics module (effective rank, dormant ratio, measured sparsity, wall-clock).
-5. Remaining methods → Tier 1 sweep → Tier 2 headline.
+2. ~~`SSLReplayBuffer` + `AuxTask` interface~~ **DONE**
+3. ~~Vertical slice: L1, magnitude pruning, autoencoder, contrastive~~ **DONE**
+4. ~~Metrics module~~ **DONE**
+5. Remaining methods → Tier 1 sweep (**RUNNING**) → Tier 2 headline.
+
+---
+
+## Steps 2–4: what was built
+
+### `RL/ssl_buffer.py` — `SSLReplayBuffer`
+uint8 for images / float32 for vectors (auto, overridable). Stores
+`(obs_t, obs_{t+k}, action_t)`; `k` is per-`sample()` so one buffer serves every family,
+and `k=0` means "single frames" so reconstructive tasks are not needlessly restricted to
+non-terminal steps. Pair validity excludes **both** episode boundaries and ring-buffer
+wrap past the write head. Verified by encoding the timestep into pixel values and decoding
+it back out of sampled pairs — gaps are exactly `k`, always.
+
+### `RL/aux_tasks.py` — `AuxTask`
+`NoAuxTask` (null object), `AutoencoderTask`, `ContrastiveTask` (CURL), DrQ `random_shift`.
+The autoencoder decoder mirrors the encoder with `output_padding` **solved per layer**, so
+it inverts any input shape rather than only 64×64.
+
+**CURL temperature defaults to 1.0, i.e. off.** The bilinear `W` already learns its own
+scale, so a second temperature just multiplies it — and because these logits are
+unnormalised they grow with ‖feat‖², so a 0.1 temperature compounds that by another 10×.
+Kept as a sweepable parameter; do not treat it as free.
+
+Unclipped, the contrastive loss transiently blows up (observed peak 5.3 → final 0.98).
+Clipped as `ssl_update` does: peak 4.3 → final 0.06. The clip is load-bearing, not hygiene.
+
+### `RL/sparsity.py` — `SparsityMethod`
+`NoSparsity`, `L1Regularization`, `MagnitudePruning` (Zhu–Gupta cubic, global threshold).
+Masks re-applied after **every** optimizer step — verified that skipping this lets momentum
+and weight decay resurrect pruned weights (sparsity → 0.0).
+
+Two traps found the hard way:
+- **`end_step` must be reachable within the run's update count.** A schedule ending at
+  step 100 in a run that only performs 28 updates silently plateaus at `schedule(20)`.
+  Confirmed exactly: measured 0.3904 vs predicted 0.3904.
+- **Masks must follow the parameter's device.** `set_training_mode` moves the net
+  cpu↔cuda every iteration; masks built on one device fail on the next call.
+
+### `RL/metrics.py`
+Entropy effective rank (default), `srank_δ`, dormant ratio (τ=0.025, normalised so it is
+scale-invariant), measured sparsity, `HeldOutBatch`. Validated against known-rank matrices:
+rank-1 → 1.00, rank-4 → 3.94, isotropic-32 → 31.9.
+
+### `RL/PPO.py` wiring
+New kwargs: `aux_task`, `sparsity`, `ssl_coef`, `ssl_updates_per_rollout`,
+`ssl_batch_size`, `ssl_buffer_capacity`, `ssl_lr`, `metrics_every`, `metrics_batch`.
+SSL heads join the existing optimizer as a param group (torch skips params whose `.grad`
+is None, and every path zero-grads with `set_to_none=True`, so each path moves only what
+it touched).
+
+**`_shared_backward` now has a third independently-clipped path for the weight
+regulariser** — same reasoning as the actor/critic split. An L1 penalty's gradient is
+`coef·sign(w)` everywhere, so its norm is `coef·√n`; at `coef=1e-3` over 340k weights that
+is **0.583, already above `max_grad_norm=0.5` on its own**. Folded into the actor path it
+would consume the whole clip budget and starve the policy — the exact failure that method
+exists to prevent. Measured, not assumed.
+
+### `RL/env_utils.py` — `FrameStackWrapper` (new)
+Grayscale + resize + k-frame stack → `(k, H, W)`. **Atari needs this**: `PixelObsWrapper`
+returns one RGB frame, and a feedforward policy cannot recover the Breakout ball's
+direction from a single frame. Without it every arm is handicapped equally and the
+differences under study compress toward zero. Grayscale keeps channels at `k` not `3k`,
+making the shape identical to FlappyBirdImg's `(4,64,64)` — same encoder, same decoders,
+no special-casing.
 
 ### Step 2 design (agreed)
 
@@ -190,14 +328,62 @@ Tuning per-method-per-env is unaffordable; tuning only the baseline rigs the com
 
 ---
 
+## Step 5: the running ALE sweep
+
+`ALE/Breakout-v5`, 4-frame grayscale stack at 64×64, 4M frames/run (166 iters @
+n_steps=2000 × n_envs=12), 5 seeds, 17 conditions = **85 runs ≈ 59h**.
+
+| family | levels |
+|---|---|
+| magnitude pruning | 80%, 90%, 95%, 99% target sparsity |
+| L1 | coef 1e-6, 1e-5, 1e-4, 1e-3 |
+| autoencoder | ssl_coef 0.01, 0.1, 1.0, 10 |
+| contrastive (CURL) | ssl_coef 0.01, 0.1, 1.0, 10 |
+
+**Sparsity levels apply to magnitude pruning only.** L1 has no sparsity target — it shrinks
+weights without zeroing them — so it is swept over its coefficient and its *achieved*
+sparsity reported (≈0 exact zeros). Reporting a requested level L1 never reaches would be
+a fiction; see `fig5_measured_sparsity.png`.
+
+**Levels were chosen by measuring effective gradient norm after clipping**, so no two arms
+are secretly identical. All levels produce distinct updates; the **top level of each sweep
+saturates `max_grad_norm=0.5`** and means "auxiliary term dominates" — going higher would
+produce an identical arm.
+
+| coef | AE raw grad | CURL raw grad | L1 raw grad |
+|---|---|---|---|
+| low | 0.0016 | 0.0007 | 0.0006 |
+| … | 0.0159 / 0.1592 | 0.0076 / 0.0756 | 0.0058 / 0.0583 |
+| top | 1.5921 → **clipped** | 0.7785 → **clipped** | 0.5831 → **clipped** |
+
+Pruning schedule `start=500, end=4000` of ~9.4k updates — pruning completes ~43% through
+training, leaving the majority of the run to recover.
+
+Throughput measured end-to-end: **1734 fps baseline / ~1650 with SSL** (SSL overhead only
+~3%; the network forward during collection dominates, not the emulator).
+
+---
+
 ## Environment notes
 
-- Python 3.11, torch 2.11.0+cu130, CUDA available, 16 CPUs.
-- `gymnasium` NOT installed — only custom envs in `RL/environments/` run right now.
-  Needed for Tier 1/2. `numpy 2.4.3`, `opencv-python`, `matplotlib`, `scipy` present.
+- Python 3.11, **torch 2.6.0+cu124** (the earlier "2.11.0+cu130" was wrong), CUDA
+  available, 16 CPUs, RTX 4070 Laptop 8.6 GB, 34 GB RAM.
+- `gymnasium 0.29.1`, `ale-py 0.8.1`, `minatar 1.0.15` now **installed**.
+  `numpy`, `opencv-python`, `matplotlib`, `scipy` present.
+- **MinAtar does not work with `CNNEncoder` as-is**: it is 10×10, and the k8/s4 first conv
+  collapses that to 1×1, after which the k4 conv fails. It only appears to work through
+  `PixelObsWrapper`, which silently upscales 10×10 → 64×64 — wasted compute, not a real
+  Tier 1. Using it needs the mini-CNN branch to trigger on spatial dims.
 - **Any script spawning env workers needs `if __name__ == '__main__':`** (Windows spawn).
 - Use `python -u` for scripts whose output is redirected, or nothing appears until exit.
 
 Verification scripts live in the session scratchpad (not the repo): `entropy_gradient_check.py`,
 `refactor_check.py`, `diagnose.py`, `grad_balance.py`, `optimizer_ablation.py`, `final_verify.py`.
 They are regenerable from this document if lost.
+
+Session 2 scratchpad scripts: `sharing_penalty_flappy.py` + `run_batch.py` (the pixel
+sharing grid), `test_step234.py` (45 unit tests), `test_integration.py` (end-to-end),
+`compare_pristine.py` (**the real regression test** — pristine HEAD vs edited PPO under
+cudnn-deterministic, bit-identical), `test_determinism.py`, `check_coef_range.py`
+(clip-saturation measurement), `bench_envs.py` / `bench_ale_e2e.py`, `sweep_ale.py` +
+`run_sweep.py`, `plots.py`, `analyze.py`.

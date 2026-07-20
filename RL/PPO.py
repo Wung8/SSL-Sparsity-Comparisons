@@ -10,6 +10,10 @@ from RL.buffers import RolloutBuffer
 from RL.vec_env_handler import ParallelEnvManager
 from RL.encoders import ActorCritic
 from RL.experiment_utils import set_global_seed, RunLogger
+from RL.ssl_buffer import SSLReplayBuffer
+from RL.aux_tasks import NoAuxTask, make_aux_task
+from RL.sparsity import NoSparsity, make_sparsity
+from RL.metrics import HeldOutBatch, representation_report
 
 from RL.common_networks import (
     base_MLP_model,
@@ -50,6 +54,15 @@ class PPO():
             feature_dim = None, # encoder width; None -> 64 (MLP) / 256 (CNN)
             seed = None, # seeds process RNGs and env workers; None = unseeded
             logger = None, # RunLogger instance, or None for no CSV logging
+            aux_task = None, # AuxTask instance or name; None -> NoAuxTask (baseline)
+            sparsity = None, # SparsityMethod instance or name; None -> NoSparsity (baseline)
+            ssl_coef = 1.0, # weight on the auxiliary loss (independent variable, not a nuisance knob)
+            ssl_updates_per_rollout = 8, # SSL grad steps per rollout; own cadence, not PPO's
+            ssl_batch_size = 256,
+            ssl_buffer_capacity = 4096, # timesteps PER ENV -> capacity * n_envs frames
+            ssl_lr = None, # SSL param-group lr; None -> lr
+            metrics_every = 0, # compute representation metrics every N iterations; 0 = off
+            metrics_batch = 4096, # held-out batch size for effective rank / dormant ratio
         ):
 
         if isinstance(observation_space, int):
@@ -81,6 +94,12 @@ class PPO():
         self.optimizer_name = optimizer
         self.seed = seed
         self.logger = logger
+        self.ssl_coef = ssl_coef
+        self.ssl_updates_per_rollout = ssl_updates_per_rollout
+        self.ssl_batch_size = ssl_batch_size
+        self.ssl_buffer_capacity = ssl_buffer_capacity
+        self.ssl_lr = ssl_lr if ssl_lr is not None else lr
+        self.metrics_every = metrics_every
 
         if seed is not None:
             set_global_seed(seed)
@@ -120,11 +139,78 @@ class PPO():
         else:
             self.distribution = MultiCategoricalDistribution
 
+        # --- SSL + sparsity ---------------------------------------------------------
+        # Both default to null objects, so a baseline run executes the same code path as
+        # an SSL/sparsity run with the method removed -- no `if ssl:` branching anywhere
+        # that could quietly make the control condition a different algorithm.
+        # accept either a constructed instance or a name string
+        self.aux_task = aux_task if hasattr(aux_task, "loss") else make_aux_task(aux_task)
+        self.sparsity = sparsity if hasattr(sparsity, "regularizer") else make_sparsity(sparsity)
+
+        self.has_ssl = not isinstance(self.aux_task, NoAuxTask)
+        self.has_sparsity = not isinstance(self.sparsity, NoSparsity)
+
+        if self.has_ssl:
+            if self.ac is None:
+                raise RuntimeError(
+                    "SSL tasks need a shared encoder; PPO was constructed with models=..."
+                )
+            if not self.shared_encoder:
+                raise RuntimeError(
+                    "SSL tasks need shared_encoder=True (nothing to attach to otherwise)"
+                )
+            self.aux_task.build(self.ac.encoder, observation_space, action_space, self.device)
+
+        # The buffer is also the observation source for the held-out metrics batch, so a
+        # baseline run with metrics enabled still needs one -- just big enough to fill it.
+        if self.has_ssl:
+            capacity = ssl_buffer_capacity
+        elif metrics_every:
+            capacity = max(64, -(-metrics_batch // max(n_envs, 1)))
+        else:
+            capacity = 0
+
+        self.ssl_buffer = SSLReplayBuffer(
+            capacity=capacity,
+            observation_space=observation_space,
+            action_dim=self.action_dim,
+            n_envs=n_envs,
+        ) if capacity else None
+
+        self.modules_dict = self._build_modules_dict()
+        self.sparsity.on_init(self.modules_dict)
+
+        self.held_out = HeldOutBatch(n=metrics_batch, device=self.device) \
+            if metrics_every else None
+
         self._build_optimizers()
 
         if env != None:
             self.env_manager = ParallelEnvManager(self.env, self.n_envs, seed=seed)
             self.last_obs = self.env_manager.reset()
+
+    def _build_modules_dict(self):
+        '''
+        Named view of the network for SparsityMethod. Names matter: _prunable() excludes
+        'policy_head'/'value_head' unless include_heads=True.
+
+        The legacy models=(policy, value) path exposes whole Sequentials, whose final
+        Linear IS the output layer -- so include_heads has no effect there and pruning
+        would reach the output. SSL already refuses that path; sparsity on it is
+        untested and not part of the study.
+        '''
+        if self.ac is None:
+            return {"policy": self.model, "value": self.value_net}
+        return {
+            "encoder": self.ac.encoder,
+            "value_encoder": self.ac.value_encoder,
+            "policy_head": self.ac.policy_head,
+            "value_head": self.ac.value_head,
+        }
+
+    def _ssl_params(self):
+        '''Params the SSL loss is allowed to move: shared trunk + the task's own heads.'''
+        return list(self.ac.encoder.parameters()) + list(self.aux_task.parameters())
 
     def _build_optimizers(self):
         '''
@@ -156,6 +242,12 @@ class PPO():
                 {"params": list(self.ac.policy_head.parameters()), "lr": self.lr},
                 {"params": list(self.ac.value_head.parameters()), "lr": self.value_lr},
             ]
+            # SSL heads join the same optimizer rather than getting their own. Torch
+            # skips params whose .grad is None, and every backward here is preceded by
+            # zero_grad(set_to_none=True), so each path only moves the params it touched.
+            aux_params = list(self.aux_task.parameters())
+            if aux_params:
+                groups.append({"params": aux_params, "lr": self.ssl_lr})
             cls = torch.optim.Adam if self.optimizer_name == "adam" else torch.optim.RMSprop
             self.opt = cls(groups, weight_decay=1e-5)
             self.opt_value_net = None
@@ -178,7 +270,8 @@ class PPO():
         self.set_training_mode(True)
         clip_range = self.clip_range
 
-        stats = {"policy_loss": [], "value_loss": [], "entropy": [], "approx_kl": [], "clip_fraction": []}
+        stats = {"policy_loss": [], "value_loss": [], "entropy": [], "approx_kl": [],
+                 "clip_fraction": [], "sparsity_reg": []}
 
         for epoch in range(self.epochs):
             for rollout_data in self.rollout_buffer.get(self.batch_size):
@@ -215,10 +308,18 @@ class PPO():
                 stats["value_loss"].append(value_loss.item())
                 stats["entropy"].append(entropy_loss.item())
 
+                # Weight-space penalty (L1/L0). Data-independent, so it rides along with
+                # the actor path rather than getting its own backward.
+                reg = self.sparsity.regularizer(self.modules_dict)
+                if reg is not None:
+                    stats["sparsity_reg"].append(reg.item())
+
                 if self.single_optimizer:
-                    self._shared_backward(policy_loss, entropy_loss, value_loss)
+                    self._shared_backward(policy_loss, entropy_loss, value_loss, reg)
                 else:
                     loss = policy_loss - self.ent_coef * entropy_loss
+                    if reg is not None:
+                        loss = loss + reg
 
                     # policy and value sit on independent trunks here, so their graphs
                     # are disjoint and no retain_graph is needed
@@ -233,11 +334,15 @@ class PPO():
                     self.opt_value_net.step()
 
                 self.n_updates += 1
+                # after EVERY optimizer step: re-apply masks and advance the schedule,
+                # or momentum/weight-decay will resurrect pruned weights
+                self.sparsity.after_step(self.modules_dict, self.n_updates)
 
         self.set_training_mode(False)
-        return {k: float(np.mean(v)) for k, v in stats.items()}
+        # sparsity_reg is empty on baseline runs; None keeps the CSV column present
+        return {k: (float(np.mean(v)) if v else None) for k, v in stats.items()}
 
-    def _shared_backward(self, policy_loss, entropy_loss, value_loss):
+    def _shared_backward(self, policy_loss, entropy_loss, value_loss, reg=None):
         '''
         Shared trunk, but the actor and critic paths are clipped INDEPENDENTLY.
 
@@ -257,21 +362,90 @@ class PPO():
         actor_loss = policy_loss - self.ent_coef * entropy_loss
         critic_loss = self.vf_coef * value_loss
 
-        self.opt.zero_grad(set_to_none=True)
-        actor_loss.backward(retain_graph=True)
-        nn.utils.clip_grad_norm_(params, self.max_grad_norm)
-        actor_grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
+        def backward_and_clip(loss, retain):
+            '''One independently-clipped path: returns its clipped gradients.'''
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=retain)
+            nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+            return [None if p.grad is None else p.grad.detach().clone() for p in params]
+
+        # The weight regulariser gets its OWN clip for the same reason the critic does.
+        # An L1 penalty's gradient is coef*sign(w) everywhere, so its norm is
+        # coef*sqrt(n_params) -- at coef=1e-3 over 340k weights that is ~0.58, already
+        # above max_grad_norm on its own. Folded into the actor path it would consume
+        # the entire clip budget and scale the policy signal to nearly nothing, which is
+        # exactly the failure this method exists to avoid.
+        paths = [backward_and_clip(actor_loss, retain=True)]
+        if reg is not None:
+            paths.append(backward_and_clip(reg, retain=True))
+        paths.append(backward_and_clip(critic_loss, retain=False))
 
         self.opt.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(params, self.max_grad_norm)
-
-        for p, g in zip(params, actor_grads):
-            if g is None:
-                continue
-            p.grad = g if p.grad is None else p.grad + g
+        for grads in paths:
+            for p, g in zip(params, grads):
+                if g is None:
+                    continue
+                p.grad = g if p.grad is None else p.grad + g
 
         self.opt.step()
+
+    def ssl_update(self):
+        '''
+        SSL runs on its own cadence off the replay buffer -- NOT inside PPO's epoch loop
+        over on-policy rollouts. Decoupling them is what lets the SSL task see old data
+        many times while PPO sees each rollout a fixed number of times, which is most of
+        the sample-efficiency argument for auxiliary tasks in the first place.
+
+        This is the third independently-clipped gradient path described in
+        _shared_backward: its own zero_grad / backward / clip / step, so the SSL gradient
+        cannot be rescaled by whatever the value gradient happens to be doing.
+
+        Returns mean SSL loss, or None when nothing ran.
+        '''
+        if not self.has_ssl or self.ssl_updates_per_rollout <= 0:
+            return None
+
+        k = self.aux_task.k_step
+        if not self.ssl_buffer.can_sample(self.ssl_batch_size, k):
+            return None  # buffer still warming up
+
+        self.set_training_mode(True)
+        self.aux_task.to(self.device).train(True)
+
+        losses = []
+        for _ in range(self.ssl_updates_per_rollout):
+            batch = self.ssl_buffer.sample(self.ssl_batch_size, k=k, device=self.device)
+            loss = self.aux_task.loss(batch, self.ac.encoder)
+            if loss is None:
+                break
+
+            self.opt.zero_grad(set_to_none=True)
+            (self.ssl_coef * loss).backward()
+            nn.utils.clip_grad_norm_(self._ssl_params(), self.max_grad_norm)
+            self.opt.step()
+
+            self.aux_task.after_step()      # EMA / momentum bookkeeping
+            self.n_updates += 1
+            self.sparsity.after_step(self.modules_dict, self.n_updates)
+
+            losses.append(loss.item())
+
+        self.set_training_mode(False)
+        return float(np.mean(losses)) if losses else None
+
+    def compute_metrics(self):
+        '''Representation health on the fixed held-out batch. None until it is filled.'''
+        if self.held_out is None or self.ssl_buffer is None:
+            return None
+        if not self.held_out.fill_from(self.ssl_buffer):
+            return None
+
+        self.set_training_mode(True)
+        report = representation_report(
+            self.ac.encoder, self.held_out.obs.to(self.device), self.modules_dict
+        )
+        self.set_training_mode(False)
+        return report
 
     def _policy_params(self):
         if self.ac is not None:
@@ -325,17 +499,33 @@ class PPO():
             num_steps += self.rollout_buffer.size()
             self.num_timesteps += self.rollout_buffer.size() * self.n_envs
             stats = self.train()
+            ssl_loss = self.ssl_update()
 
             if self.verbose: print(round(score,3))
             else: print()
             self.training_history.append(score)
+            iteration = len(self.training_history)
 
             if self.logger is not None:
+                # RunLogger fixes its columns on the FIRST log() call, so every metric
+                # must appear from iteration 1 even when its value is not available yet
+                # -- otherwise it is silently dropped for the whole run.
+                metrics = None
+                if self.metrics_every and iteration % self.metrics_every == 0:
+                    metrics = self.compute_metrics()
+                metrics = metrics or {}
+
                 self.logger.log(
-                    iteration=len(self.training_history),
+                    iteration=iteration,
                     env_steps=self.num_timesteps,
                     n_updates=self.n_updates,
                     score=float(score),
+                    ssl_loss=ssl_loss,
+                    measured_sparsity=self.sparsity.measured_sparsity(self.modules_dict)
+                        if self.has_sparsity else None,
+                    eff_rank=metrics.get("eff_rank"),
+                    srank=metrics.get("srank"),
+                    dormant_ratio=metrics.get("dormant_ratio"),
                     **stats,
                 )
 
@@ -363,6 +553,11 @@ class PPO():
                 values,
                 log_probs,
             )
+            # SSL sees the same stream but keeps it across rollouts (uint8, off-policy).
+            # dones here marks termination of the transition OUT of last_obs, which is
+            # exactly the convention SSLReplayBuffer assumes for pair validity.
+            if self.ssl_buffer is not None:
+                self.ssl_buffer.add(self.last_obs, actions, dones)
             total_rewards += sum(rewards)
             total_dones += abs(sum(dones))
 

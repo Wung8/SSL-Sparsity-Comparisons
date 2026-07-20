@@ -55,6 +55,56 @@ class SkipFrameWrapper:
         self.env.close()
     
 
+class FrameStackWrapper:
+    '''
+    Grayscale + resize + k-frame stack, emitting (k, H, W) float32 in [0,1].
+
+    PixelObsWrapper alone is not enough for Atari: it returns a single RGB frame, from
+    which velocity is unrecoverable. A feedforward policy cannot tell which way the
+    Breakout ball is travelling from one frame, so every method would be handicapped
+    equally and the differences under study would be compressed toward zero.
+
+    Grayscale rather than stacked RGB keeps the channel count at k instead of 3k, which
+    also makes the observation shape identical to FlappyBirdImg's (4, 64, 64) -- so the
+    same encoder and the same SSL decoders apply without special-casing.
+    '''
+
+    def __init__(self, env, k=4, dsize=(64, 64), **kwargs):
+        self.env = env
+        self.k = k
+        self.dsize = dsize
+        self.stack = None
+
+    def _frame(self, obs):
+        obs = np.asarray(obs)
+        if obs.ndim == 3 and obs.shape[2] == 3:
+            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        obs = cv2.resize(obs, dsize=self.dsize, interpolation=cv2.INTER_AREA)
+        return obs.astype(np.float32) / 255.0
+
+    def _stacked(self):
+        return np.stack(self.stack, axis=0)
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        obs = result[0] if isinstance(result, tuple) else result
+        f = self._frame(obs)
+        # start-of-episode: repeat the first frame so the stack is never zero-padded,
+        # which would otherwise look like a hard scene cut to the encoder
+        self.stack = [f.copy() for _ in range(self.k)]
+        info = result[1] if isinstance(result, tuple) and len(result) > 1 else {}
+        return self._stacked(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.stack.pop(0)
+        self.stack.append(self._frame(obs))
+        return self._stacked(), reward, terminated, truncated, info
+
+    def close(self):
+        self.env.close()
+
+
 class PixelObsWrapper:
     def __init__(self, env, dsize=(64,64), **kwargs):
         self.env = env
