@@ -335,10 +335,53 @@ n_steps=2000 × n_envs=12), 5 seeds, 17 conditions = **85 runs ≈ 59h**.
 
 | family | levels |
 |---|---|
-| magnitude pruning | 80%, 90%, 95%, 99% target sparsity |
+| magnitude pruning | 90%, 95%, 99%, **99.9%** target sparsity |
 | L1 | coef 1e-6, 1e-5, 1e-4, 1e-3 |
-| autoencoder | ssl_coef 0.01, 0.1, 1.0, 10 |
-| contrastive (CURL) | ssl_coef 0.01, 0.1, 1.0, 10 |
+| autoencoder | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+| contrastive (CURL) | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+
+### Why SSL is swept over `ssl_lr` and NOT a loss coefficient
+
+**An auxiliary loss coefficient is inert when SSL takes its own optimizer step.** RMSprop
+and Adam update by `lr·g/√v`, so scaling the loss by `c` scales `g` and `√v` alike and the
+ratio cancels. Measured on the encoder's actual weight change:
+
+| knob | 1000× range produces | verdict |
+|---|---|---|
+| `ssl_coef` | 1.1–3.6× movement, **inverted** (clipping caps the top) | inert |
+| `ssl_lr` *(before fix)* | 1–4× | inert — it only reached the aux head |
+| `ssl_lr` *(after fix)* | **235× (AE), 671× (CURL)**, monotone | works |
+
+This was caught mid-sweep: the autoencoder AUC was flat across a 1000× coefficient range
+(4.52/4.47/4.62/4.70) and `curl` at coef 0.01 — supposedly a near-no-op — ran far below
+baseline. ~27h of the first sweep was measuring an axis that did not vary.
+
+**The sparsity half was never affected, and the contrast is the proof.** L1's gradient is
+*summed with* the actor and critic gradients before one shared step, so its coefficient
+changes the gradient's composition rather than its scale — which is exactly why L1 shows a
+clean monotone dose–response and a visible dose-dependent takeoff delay while SSL showed
+nothing.
+
+**The fix follows CURL.** CURL has no loss coefficient anywhere; it creates two optimizers
+and steps them after a single contrastive backward:
+
+```python
+self.encoder_optimizer = torch.optim.Adam(self.critic.encoder.parameters(), lr=encoder_lr)
+self.cpc_optimizer     = torch.optim.Adam(self.CURL.parameters(),           lr=encoder_lr)
+```
+
+The original implementation here had only the second of those — `ssl_lr` was attached to
+the aux head alone, so the shared trunk moved at the *policy* `lr` regardless. `PPO` now
+builds `opt_ssl` over **encoder + aux heads** at `ssl_lr` (`_build_ssl_optimizer`). The
+encoder consequently sits in two optimizers with independent state; that is deliberate in
+CURL too, so RL and representation learning can step the same weights at different rates.
+
+`ssl_coef` is retained (it still sets where the SSL gradient meets `max_grad_norm`) but it
+is **not** the influence variable. Verified after the change: baseline still bit-identical
+to pristine.
+
+Runs from the first sweep whose axis was inert are in `runs_ale_archive/`, not deleted —
+they remain valid replicates of a single condition (autoencoder at 8 updates/rollout).
 
 **Sparsity levels apply to magnitude pruning only.** L1 has no sparsity target — it shrinks
 weights without zeroing them — so it is swept over its coefficient and its *achieved*

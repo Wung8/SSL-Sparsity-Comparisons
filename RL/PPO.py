@@ -242,16 +242,41 @@ class PPO():
                 {"params": list(self.ac.policy_head.parameters()), "lr": self.lr},
                 {"params": list(self.ac.value_head.parameters()), "lr": self.value_lr},
             ]
-            # SSL heads join the same optimizer rather than getting their own. Torch
-            # skips params whose .grad is None, and every backward here is preceded by
-            # zero_grad(set_to_none=True), so each path only moves the params it touched.
-            aux_params = list(self.aux_task.parameters())
-            if aux_params:
-                groups.append({"params": aux_params, "lr": self.ssl_lr})
             cls = torch.optim.Adam if self.optimizer_name == "adam" else torch.optim.RMSprop
             self.opt = cls(groups, weight_decay=1e-5)
             self.opt_value_net = None
             self.single_optimizer = True
+
+        self._build_ssl_optimizer()
+
+    def _build_ssl_optimizer(self):
+        '''
+        SSL gets its OWN optimizer over the shared trunk plus its own heads, at `ssl_lr`.
+        This follows CURL, which creates exactly two:
+
+            encoder_optimizer = Adam(critic.encoder.parameters(), lr=encoder_lr)
+            cpc_optimizer     = Adam(CURL.parameters(),           lr=encoder_lr)
+
+        and steps both after a single contrastive backward, with NO loss coefficient
+        anywhere. The encoder therefore sits in two optimizers with independent state --
+        deliberate in CURL, not an oversight: RL and representation learning step the
+        same weights at different rates.
+
+        Why this matters here. An auxiliary LOSS COEFFICIENT cannot control SSL influence
+        when SSL takes its own optimizer step: RMSprop and Adam update by lr*g/sqrt(v),
+        so scaling the loss by c scales g and sqrt(v) alike and the ratio cancels.
+        Measured: a 1000x `ssl_coef` range moved the encoder only 1.1-3.6x, and inverted
+        (clipping caps the high end). `ssl_lr` multiplies AFTER that normalisation, so it
+        does scale the step -- it is the real knob, and it is the one CURL exposes.
+
+        `ssl_coef` is retained because it still sets where the gradient meets
+        max_grad_norm, but it is NOT the influence variable. Sweep `ssl_lr`.
+        '''
+        self.opt_ssl = None
+        if not self.has_ssl:
+            return
+        cls = torch.optim.Adam if self.optimizer_name == "adam" else torch.optim.RMSprop
+        self.opt_ssl = cls(self._ssl_params(), lr=self.ssl_lr, weight_decay=1e-5)
 
     def parameters(self):
         if self.ac is not None:
@@ -419,10 +444,12 @@ class PPO():
             if loss is None:
                 break
 
-            self.opt.zero_grad(set_to_none=True)
+            # steps opt_ssl, NOT opt: the encoder must move at ssl_lr here, at lr on the
+            # RL path. Sharing one optimizer is what made ssl_lr reach only the aux head.
+            self.opt_ssl.zero_grad(set_to_none=True)
             (self.ssl_coef * loss).backward()
             nn.utils.clip_grad_norm_(self._ssl_params(), self.max_grad_norm)
-            self.opt.step()
+            self.opt_ssl.step()
 
             self.aux_task.after_step()      # EMA / momentum bookkeeping
             self.n_updates += 1
