@@ -44,6 +44,87 @@ def random_shift(imgs, pad=4):
     return padded[batch, :, idx_r[:, :, None], idx_c[:, None, :]].permute(0, 3, 1, 2)
 
 
+def _conv_input_shapes(encoder, observation_space):
+    '''Spatial size entering each Conv2d, recorded by replaying the encoder stack.'''
+    shapes = []
+    with torch.no_grad():
+        x = torch.zeros((1, *observation_space))
+        for layer in encoder.cnn:
+            if isinstance(layer, nn.Flatten):
+                break
+            if isinstance(layer, nn.Conv2d):
+                shapes.append(tuple(x.shape[-2:]))
+            x = layer(x)
+    return shapes
+
+
+def _output_padding(conv, cur_hw, tgt_hw):
+    '''
+    output_padding that makes a ConvTranspose2d invert `conv` back onto tgt spatial size,
+    solved rather than hardcoded so it works for any input shape (see AutoencoderTask).
+    '''
+    k, s, p = conv.kernel_size[0], conv.stride[0], conv.padding[0]
+    op = tuple(t - ((c - 1) * s - 2 * p + k) for c, t in zip(cur_hw, tgt_hw))
+    assert all(0 <= o < max(s, 1) for o in op), (
+        f"cannot invert conv: output_padding {op} out of range for stride {s}"
+    )
+    return op
+
+
+def _build_mirror_decoder(encoder, observation_space, device):
+    '''
+    Decoder that mirrors the encoder's conv stack and maps the shared feature vector back
+    to an observation. Shared by the whole reconstructive family (autoencoder, VQ-VAE,
+    masked VQ-VAE) so "one decoder chain" is literally one function, per the study plan.
+    '''
+    if not hasattr(encoder, "conv_out_shape"):
+        raise ValueError("reconstructive SSL needs a CNNEncoder (conv_out_shape missing)")
+
+    convs = [l for l in encoder.cnn if isinstance(l, nn.Conv2d)]
+    shapes = _conv_input_shapes(encoder, observation_space)
+
+    c_out, h_out, w_out = encoder.conv_out_shape
+    layers = [
+        nn.Linear(encoder.output_dim, encoder.n_flatten),
+        nn.Mish(),
+        nn.Unflatten(-1, (c_out, h_out, w_out)),
+    ]
+
+    cur = (h_out, w_out)
+    for i, conv in enumerate(reversed(convs)):
+        tgt = shapes[len(convs) - 1 - i]
+        op = _output_padding(conv, cur, tgt)
+        last = i == len(convs) - 1
+        layers.append(nn.ConvTranspose2d(
+            conv.out_channels, conv.in_channels,
+            kernel_size=conv.kernel_size[0], stride=conv.stride[0],
+            padding=conv.padding[0], output_padding=op,
+        ))
+        if not last:
+            layers.append(nn.Mish())
+        cur = tgt
+
+    return nn.Sequential(*layers).to(device)
+
+
+def random_patch_mask(obs, patch=8, ratio=0.5):
+    '''
+    MAE-style masking for a CNN: zero out a fraction of square patches. A single-vector
+    CNN encoder has no per-patch tokens, so this is the tractable analog of MAE -- corrupt
+    the input by patches, reconstruct the ORIGINAL. Returns (masked_obs, keep_mask).
+    '''
+    b, c, h, w = obs.shape
+    gh, gw = h // patch, w // patch
+    keep = (torch.rand(b, 1, gh, gw, device=obs.device) > ratio).float()
+    keep = keep.repeat_interleave(patch, 2).repeat_interleave(patch, 3)
+    # pad to full size if h/w not divisible by patch (kept regions default to visible)
+    if keep.shape[-2:] != (h, w):
+        full = torch.ones(b, 1, h, w, device=obs.device)
+        full[..., : keep.shape[-2], : keep.shape[-1]] = keep
+        keep = full
+    return obs * keep, keep
+
+
 class AuxTask:
     name = "none"
     # k-step gap the task needs from the replay buffer. 0 = single frames.
@@ -103,51 +184,7 @@ class AutoencoderTask(AuxTask):
         self.decoder = None
 
     def build(self, encoder, observation_space, action_space, device):
-        if not hasattr(encoder, "conv_out_shape"):
-            raise ValueError("AutoencoderTask needs a CNNEncoder (conv_out_shape missing)")
-
-        convs = [l for l in encoder.cnn if isinstance(l, nn.Conv2d)]
-
-        # replay the encoder to record the spatial size entering each conv layer
-        shapes = []
-        with torch.no_grad():
-            x = torch.zeros((1, *observation_space))
-            for layer in encoder.cnn:
-                if isinstance(layer, nn.Flatten):
-                    break
-                if isinstance(layer, nn.Conv2d):
-                    shapes.append(tuple(x.shape[-2:]))
-                x = layer(x)
-
-        c_out, h_out, w_out = encoder.conv_out_shape
-        layers = [
-            nn.Linear(encoder.output_dim, encoder.n_flatten),
-            nn.Mish(),
-            nn.Unflatten(-1, (c_out, h_out, w_out)),
-        ]
-
-        cur_h, cur_w = h_out, w_out
-        for i, conv in enumerate(reversed(convs)):
-            tgt_h, tgt_w = shapes[len(convs) - 1 - i]
-            k = conv.kernel_size[0]
-            s = conv.stride[0]
-            p = conv.padding[0]
-            op_h = tgt_h - ((cur_h - 1) * s - 2 * p + k)
-            op_w = tgt_w - ((cur_w - 1) * s - 2 * p + k)
-            assert 0 <= op_h < max(s, 1) and 0 <= op_w < max(s, 1), (
-                f"cannot invert conv {i}: output_padding ({op_h},{op_w}) out of range for stride {s}"
-            )
-            last = i == len(convs) - 1
-            layers.append(nn.ConvTranspose2d(
-                conv.out_channels, conv.in_channels,
-                kernel_size=k, stride=s, padding=p,
-                output_padding=(op_h, op_w),
-            ))
-            if not last:
-                layers.append(nn.Mish())
-            cur_h, cur_w = tgt_h, tgt_w
-
-        self.decoder = nn.Sequential(*layers).to(device)
+        self.decoder = _build_mirror_decoder(encoder, observation_space, device)
 
     def loss(self, batch, encoder):
         z = encoder(batch.obs)
@@ -254,10 +291,340 @@ class ContrastiveTask(AuxTask):
         }
 
 
+class VectorQuantizer(nn.Module):
+    '''
+    Product (grouped) vector quantization of the shared feature vector.
+
+    A single 256-d representation quantized against one codebook would collapse the whole
+    state to one of K discrete symbols -- far too coarse. So the vector is split into
+    `n_groups` sub-vectors, each quantized against its own codebook, giving K**n_groups
+    effective codes. This is the standard product-VQ trick for quantizing a global vector
+    rather than a spatial feature grid.
+
+    Straight-through estimator passes the reconstruction gradient to the encoder; the VQ
+    loss (codebook + commitment) trains the codebook and pulls encoder outputs toward it.
+    '''
+
+    def __init__(self, dim, n_codes=512, n_groups=8, commitment=0.25):
+        super().__init__()
+        assert dim % n_groups == 0, f"feature dim {dim} not divisible by n_groups {n_groups}"
+        self.n_groups = n_groups
+        self.group_dim = dim // n_groups
+        self.n_codes = n_codes
+        self.commitment = commitment
+        self.codebook = nn.Parameter(torch.randn(n_groups, n_codes, self.group_dim) * 0.1)
+
+    def forward(self, z):
+        b = z.shape[0]
+        zg = z.view(b, self.n_groups, self.group_dim)          # (B, G, d)
+        cb = self.codebook                                     # (G, K, d)
+
+        # squared distances (B, G, K): |z|^2 - 2 z.e + |e|^2
+        z2 = (zg ** 2).sum(-1, keepdim=True)
+        e2 = (cb ** 2).sum(-1).unsqueeze(0)
+        ze = torch.einsum("bgd,gkd->bgk", zg, cb)
+        idx = (z2 - 2 * ze + e2).argmin(-1)                    # (B, G)
+
+        z_q = torch.stack([cb[g][idx[:, g]] for g in range(self.n_groups)], dim=1)  # (B,G,d)
+
+        codebook_loss = F.mse_loss(z_q, zg.detach())
+        commit_loss = F.mse_loss(zg, z_q.detach())
+        vq_loss = codebook_loss + self.commitment * commit_loss
+
+        z_q_st = zg + (z_q - zg).detach()                      # straight-through
+        with torch.no_grad():
+            usage = F.one_hot(idx, self.n_codes).float().mean(dim=(0, 1))
+            perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
+        return z_q_st.reshape(b, -1), vq_loss, perplexity
+
+
+class VQVAETask(AuxTask):
+    '''
+    Reconstructive SSL with a discrete bottleneck: autoencoder + a product-VQ codebook
+    between encoder and decoder. Same decoder chain as AutoencoderTask; the only addition
+    is quantization of the shared features before decoding.
+    '''
+
+    name = "vqvae"
+    k_step = 0
+
+    def __init__(self, n_codes=512, n_groups=8, commitment=0.25):
+        self.n_codes = n_codes
+        self.n_groups = n_groups
+        self.commitment = commitment
+        self.decoder = None
+        self.vq = None
+        self._last_perplexity = None
+
+    def build(self, encoder, observation_space, action_space, device):
+        self.decoder = _build_mirror_decoder(encoder, observation_space, device)
+        self.vq = VectorQuantizer(encoder.output_dim, self.n_codes,
+                                  self.n_groups, self.commitment).to(device)
+
+    def loss(self, batch, encoder):
+        z = encoder(batch.obs)
+        z_q, vq_loss, perplexity = self.vq(z)
+        self._last_perplexity = perplexity.item()
+        recon = self.decoder(z_q)
+        return F.mse_loss(recon, batch.obs) + vq_loss
+
+    def parameters(self):
+        return list(self.decoder.parameters()) + list(self.vq.parameters())
+
+    def modules(self):
+        return [m for m in (self.decoder, self.vq) if m is not None]
+
+    def config(self):
+        return {"aux_task": self.name, "n_codes": self.n_codes,
+                "n_groups": self.n_groups, "commitment": self.commitment}
+
+
+class MaskedVQVAETask(VQVAETask):
+    '''
+    VQ-VAE with MAE-style input masking: encode a patch-masked observation, quantize,
+    reconstruct the ORIGINAL (unmasked) frame. The masking forces the representation to
+    fill in occluded regions rather than copy, which is the point of masked autoencoding.
+
+    Reconstructing the original rather than only the masked patches keeps this a single
+    global-decoder objective -- a per-patch loss would need per-patch tokens the CNN
+    encoder does not produce.
+    '''
+
+    name = "masked_vqvae"
+    k_step = 0
+
+    def __init__(self, n_codes=512, n_groups=8, commitment=0.25, mask_ratio=0.5, patch=8):
+        super().__init__(n_codes, n_groups, commitment)
+        self.mask_ratio = mask_ratio
+        self.patch = patch
+
+    def loss(self, batch, encoder):
+        masked, _ = random_patch_mask(batch.obs, self.patch, self.mask_ratio)
+        z = encoder(masked)
+        z_q, vq_loss, perplexity = self.vq(z)
+        self._last_perplexity = perplexity.item()
+        recon = self.decoder(z_q)
+        return F.mse_loss(recon, batch.obs) + vq_loss
+
+    def config(self):
+        c = super().config()
+        c.update(aux_task=self.name, mask_ratio=self.mask_ratio, patch=self.patch)
+        return c
+
+
+class JEPATask(AuxTask):
+    '''
+    Joint-Embedding Predictive Architecture: predict the EMA-target embedding of one view
+    from a predictor on the online embedding of another view, in LATENT space, with no
+    negatives (unlike contrastive) and no pixel decoder (unlike the reconstructive chain).
+
+    Reuses the ContrastiveTask scaffolding -- an EMA target encoder + two augmented views
+    -- but the loss is a latent regression, and an asymmetric predictor sits on the online
+    branch. Collapse to a constant is prevented by the EMA target + predictor asymmetry,
+    the same mechanism as BYOL; there are no negatives holding the space apart, so the
+    effective-rank metric is the thing to watch on this arm.
+
+    I-JEPA's spatial mask-and-predict does not map onto a global-pooled CNN encoder (no
+    per-patch tokens), so this is the tractable single-vector JEPA.
+    '''
+
+    name = "jepa"
+    k_step = 0
+
+    def __init__(self, momentum=0.05, hidden=512, pad=4):
+        self.momentum = momentum
+        self.hidden = hidden
+        self.pad = pad
+        self.target_encoder = None
+        self.predictor = None
+        self._live_encoder = None
+
+    def build(self, encoder, observation_space, action_space, device):
+        self.target_encoder = copy.deepcopy(encoder).to(device)
+        for p in self.target_encoder.parameters():
+            p.requires_grad_(False)
+        dim = encoder.output_dim
+        self.predictor = nn.Sequential(
+            nn.Linear(dim, self.hidden), nn.Mish(), nn.Linear(self.hidden, dim),
+        ).to(device)
+        self._live_encoder = encoder
+
+    def loss(self, batch, encoder):
+        online = self.predictor(encoder(random_shift(batch.obs, self.pad)))
+        with torch.no_grad():
+            target = self.target_encoder(random_shift(batch.obs, self.pad))
+        # BYOL-style normalised MSE: 2 - 2*cos, symmetric in scale, bounded
+        online = F.normalize(online, dim=-1)
+        target = F.normalize(target, dim=-1)
+        return (2 - 2 * (online * target).sum(-1)).mean()
+
+    def after_step(self):
+        if self.target_encoder is None:
+            return
+        with torch.no_grad():
+            for tp, lp in zip(self.target_encoder.parameters(),
+                              self._live_encoder.parameters()):
+                tp.mul_(1 - self.momentum).add_(self.momentum * lp.detach())
+
+    def parameters(self):
+        return list(self.predictor.parameters())
+
+    def modules(self):
+        return [m for m in (self.target_encoder, self.predictor) if m is not None]
+
+    def config(self):
+        return {"aux_task": self.name, "momentum": self.momentum, "hidden": self.hidden,
+                "pad": self.pad}
+
+
+class LadderDecoder(nn.Module):
+    '''
+    Top-down denoising decoder with lateral connections into every encoder layer -- the
+    defining structure of a ladder network. Built from the encoder's own conv geometry so
+    it mirrors any input shape.
+
+    Each level combines the (noisy) lateral activation with the top-down reconstruction
+    from the level above, and is trained to match that level's CLEAN activation. This is
+    the layer-wise reconstruction that distinguishes ladder nets from a plain autoencoder,
+    which only reconstructs the input.
+    '''
+
+    def __init__(self, encoder, observation_space):
+        super().__init__()
+        convs = [l for l in encoder.cnn if isinstance(l, nn.Conv2d)]
+        shapes = _conv_input_shapes(encoder, observation_space)  # input spatial per conv
+        c_out, h_out, w_out = encoder.conv_out_shape
+        dim = encoder.output_dim
+
+        # denoise the top representation vector, then project it into conv space
+        self.top = nn.Sequential(nn.Linear(dim, dim), nn.Mish())
+        self.to_conv = nn.Sequential(
+            nn.Linear(dim, encoder.n_flatten), nn.Mish(),
+            nn.Unflatten(-1, (c_out, h_out, w_out)),
+        )
+
+        # per-conv combinator (fuse lateral + top-down) and upsampler (to the level below)
+        self.combinators = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        n = len(convs)
+        cur = (h_out, w_out)
+        for i, conv in enumerate(reversed(convs)):          # top conv -> bottom conv
+            ch = conv.out_channels
+            self.combinators.append(nn.Sequential(
+                nn.Conv2d(2 * ch, ch, kernel_size=3, padding=1), nn.Mish()))
+            tgt = shapes[n - 1 - i]
+            if i < n - 1:
+                op = _output_padding(conv, cur, tgt)
+                self.ups.append(nn.ConvTranspose2d(
+                    ch, conv.in_channels, kernel_size=conv.kernel_size[0],
+                    stride=conv.stride[0], padding=conv.padding[0], output_padding=op))
+            else:
+                self.ups.append(None)                       # bottom level: no further down
+            cur = tgt
+
+    def forward(self, noisy_acts):
+        # noisy_acts = [conv1, conv2, ..., convL, top_vector], bottom -> top
+        conv_acts = noisy_acts[:-1]
+        top = noisy_acts[-1]
+
+        recon_top = self.top(top)
+        u = self.to_conv(recon_top)                          # matches the top conv act
+        recon_convs = [None] * len(conv_acts)
+        for j, i in enumerate(reversed(range(len(conv_acts)))):   # top conv down
+            fused = self.combinators[j](torch.cat([conv_acts[i], u], dim=1))
+            recon_convs[i] = fused
+            if self.ups[j] is not None:
+                u = self.ups[j](fused)
+        return recon_top, recon_convs
+
+
+class LadderTask(AuxTask):
+    '''
+    Ladder network: the invasive outlier of the SSL set. Unlike every other task here it
+    needs the encoder's INTERMEDIATE activations, not just its final embedding, so it
+    forwards through encoder.cnn / encoder.fc by hand to collect them (no hooks, no
+    encoder edits).
+
+    Objective: run a clean pass (targets, detached) and a noise-corrupted pass (gradient
+    path), then a top-down decoder with lateral connections reconstructs the clean
+    activation at every layer from the noisy one. Layer-wise denoising is what makes this
+    a ladder rather than an autoencoder.
+    '''
+
+    name = "ladder"
+    k_step = 0
+
+    def __init__(self, noise_std=0.3, layer_weight=0.1):
+        self.noise_std = noise_std
+        self.layer_weight = layer_weight
+        self.decoder = None
+
+    def build(self, encoder, observation_space, action_space, device):
+        if not hasattr(encoder, "conv_out_shape"):
+            raise ValueError("LadderTask needs a CNNEncoder")
+        self.decoder = LadderDecoder(encoder, observation_space).to(device)
+
+    @staticmethod
+    def _collect(encoder, x):
+        '''Post-Mish activations at each conv block plus the final feature vector.'''
+        acts = []
+        h = x
+        for layer in encoder.cnn:
+            h = layer(h)
+            if isinstance(layer, nn.Mish):
+                acts.append(h)
+        for layer in encoder.fc:            # Linear then Mish
+            h = layer(h)
+        acts.append(h)                      # final representation vector
+        return acts
+
+    @staticmethod
+    def _standardize(a):
+        '''
+        Per-sample zero-mean unit-variance over the feature dims.
+
+        Ladder nets denoise toward the encoder's OWN clean activations, which lets the
+        encoder drive the loss down by simply inflating activation magnitude without bound
+        -- measured: top-vector norm ran from 1 to >1000 and the loss diverged. The
+        original ladder controls this with batch-norm at every layer; standardising both
+        sides here is the same fix, making the objective compare PATTERN, not scale.
+        '''
+        dims = tuple(range(1, a.dim()))
+        mean = a.mean(dim=dims, keepdim=True)
+        std = a.std(dim=dims, keepdim=True)
+        return (a - mean) / (std + 1e-5)
+
+    def loss(self, batch, encoder):
+        with torch.no_grad():
+            clean = [self._standardize(a).detach() for a in self._collect(encoder, batch.obs)]
+        noisy_in = batch.obs + self.noise_std * torch.randn_like(batch.obs)
+        noisy = self._collect(encoder, noisy_in)            # gradient path
+
+        recon_top, recon_convs = self.decoder(noisy)
+        loss = F.mse_loss(self._standardize(recon_top), clean[-1])   # top representation
+        for rec, tgt in zip(recon_convs, clean[:-1]):       # every conv layer
+            loss = loss + self.layer_weight * F.mse_loss(self._standardize(rec), tgt)
+        return loss
+
+    def parameters(self):
+        return list(self.decoder.parameters())
+
+    def modules(self):
+        return [self.decoder] if self.decoder is not None else []
+
+    def config(self):
+        return {"aux_task": self.name, "noise_std": self.noise_std,
+                "layer_weight": self.layer_weight}
+
+
 AUX_TASKS = {
     "none": NoAuxTask,
     "autoencoder": AutoencoderTask,
     "contrastive": ContrastiveTask,
+    "vqvae": VQVAETask,
+    "masked_vqvae": MaskedVQVAETask,
+    "jepa": JEPATask,
+    "ladder": LadderTask,
 }
 
 
