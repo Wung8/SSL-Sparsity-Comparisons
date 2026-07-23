@@ -240,6 +240,41 @@ differences under study compress toward zero. Grayscale keeps channels at `k` no
 making the shape identical to FlappyBirdImg's `(4,64,64)` — same encoder, same decoders,
 no special-casing.
 
+### SSL set expanded to 6 methods (`RL/aux_tasks.py`)
+
+Beyond autoencoder + contrastive, four more added, one decoder chain and one EMA
+scaffold shared across the families exactly as the grouping below intends:
+
+- **VQ-VAE** — autoencoder + a **product-VQ** codebook. A single 256-d vector quantized
+  against one codebook would collapse the state to K symbols, so the vector is split into
+  groups, each quantized (K^groups effective codes). Straight-through gradient to the
+  encoder; codebook perplexity is logged to confirm the codebook stays used.
+- **Masked VQ-VAE** — VQ-VAE + MAE-style patch masking: encode the masked frame,
+  reconstruct the **original**. A per-patch MAE loss would need per-patch tokens the
+  global-pooled CNN encoder does not produce, so it reconstructs the whole frame.
+- **JEPA** — predict the EMA-target embedding of one view from a predictor on the online
+  embedding of another, **in latent space, no negatives**. Reuses the ContrastiveTask EMA
+  scaffold; collapse is held off by EMA-target + predictor asymmetry (BYOL mechanism), so
+  effective rank is the arm to watch. I-JEPA's spatial mask-predict does not map onto a
+  single-vector encoder — this is the tractable global-vector JEPA.
+- **Ladder network** — the invasive outlier. Needs the encoder's **intermediate**
+  activations, so it forwards through `encoder.cnn`/`fc` by hand (no hooks, no encoder
+  edits). Clean pass → targets, noise-corrupted pass → gradient path, top-down decoder
+  with lateral connections denoises every layer.
+
+  **The naive ladder objective diverged** — the encoder inflated activation norms without
+  bound (top-vector norm 1 → >1000) because it denoises toward its *own* activations, a
+  moving target it can win by rescaling. The original ladder controls this with batch-norm
+  at every layer; **standardising both sides per layer** (compare pattern, not scale) is
+  the same fix and is stable. Caught by a "loss decreases when trained" test that instead
+  showed the loss *growing* — worth having.
+
+All four verified before the sweep: loss decreases when trained; VQ codebook stays used
+(perplexity > 1); JEPA does not collapse (effective rank 85 of 256 after training); ladder
+reaches conv activations and pushes gradient to the encoder; and **`ssl_lr` is a real
+influence axis for each** (167–269× encoder movement over a 1000× lr range) — the check
+that would have caught the inert-`ssl_coef` bug had it existed then.
+
 ### Step 2 design (agreed)
 
 `SSLReplayBuffer`, fed from `collect_rollouts`, own update cadence (n SSL grad steps per
@@ -339,6 +374,15 @@ n_steps=2000 × n_envs=12), 5 seeds, 17 conditions = **85 runs ≈ 59h**.
 | L1 | coef 1e-6, 1e-5, 1e-4, 1e-3 |
 | autoencoder | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
 | contrastive (CURL) | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+| VQ-VAE | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+| Masked VQ-VAE | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+| JEPA | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+| ladder network | **ssl_lr** 1e-6, 1e-5, 1e-4, 1e-3 |
+
+Full grid: 33 conditions × 5 seeds = 165 runs. The first 85 (baseline + sparsity + AE +
+CURL) are done; the 80 added by the four new SSL families are running (~54h). Resumable —
+completed cells are skipped, so this builds on the existing results rather than redoing
+them.
 
 ### Why SSL is swept over `ssl_lr` and NOT a loss coefficient
 
